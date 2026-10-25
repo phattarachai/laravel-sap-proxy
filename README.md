@@ -17,6 +17,9 @@ handles what a proxy in the middle adds:
 - **Retries a restarting proxy.** A refused, reset or empty connection (the proxy was restarted by a
   deploy or systemd) and a 502/503 from a fronting web server are retried with backoff. A timeout is
   *not* retried: it means a slow query, and retrying it would stretch the wait past any job timeout.
+- **Fails fast when SAP is down.** A proxy with a circuit breaker answers a flagged 503 when SAP
+  rejects its login or can't be reached. The driver throws `SapUnavailableException` on the first
+  answer instead of retrying, so an outage doesn't turn into a flood of logins.
 - **Encodes SQL in base64**, so a network IPS/DPI that resets connections carrying SQL-injection
   signatures (`union … select`) never sees the SQL text.
 - **Reports the failing SQL.** Successful statements fire `QueryExecuted`, so they show up in
@@ -89,7 +92,14 @@ The driver POSTs JSON and expects JSON back:
 
 // 422: the database rejected the SQL
 { "error": "sql syntax error: incorrect syntax near \"FROM\"" }
+
+// 503 + `Retry-After: 300`: SAP is unavailable (optional; the proxy's circuit breaker is open)
+{ "error": "authentication failed", "sap_unavailable": true, "reason": "auth", "retry_after": 300 }
 ```
+
+`reason` is `auth` (SAP rejected the login) or `connect` (SAP could not be reached). `retry_after`
+is the breaker's cooldown in seconds, or `null` when the breaker has latched and waits for a manual
+reset. A 503 without `sap_unavailable: true` is treated as a restarting proxy and retried.
 
 A Node.js proxy that speaks this protocol over the [`hdb`](https://www.npmjs.com/package/hdb)
 client is about 150 lines of code. Give it a SIGTERM handler that drains in-flight requests, so a
@@ -101,6 +111,60 @@ restart does not cut off queries that are still running.
 |---|---|---|
 | `Phattarachai\SapProxy\Exceptions\SapQueryException` | The proxy answered 422 | The message is the database's error text, safe to show to whoever wrote the SQL. `->sql` holds the statement. |
 | `Phattarachai\SapProxy\Exceptions\SapProxyException` | Unreachable, timed out, or a non-422 failure after every retry | The previous exception is the underlying `ConnectionException` / `RequestException`. `->sql` and `context()` hold the statement that was running. |
+| `Phattarachai\SapProxy\Exceptions\SapUnavailableException` | The proxy answered its flagged 503: SAP is unavailable | Extends `SapProxyException`. Never retried. `->reason` is `auth` or `connect`, `->retryAfter` the cooldown in seconds (`null` when latched); both are in `context()` too. |
+
+### Handling `SapUnavailableException`
+
+The exception means SAP itself is down, not your query, and every request will get the same answer
+until the proxy's cooldown ends. Because it extends `SapProxyException`, code that already catches
+that keeps working. To do better:
+
+- **Scheduled pollers** (sync jobs that run every few minutes): stop the run quietly and don't retry
+  it. The next scheduled run is the retry. Don't dispatch child jobs that would each fail the same way.
+
+  ```php
+  try {
+      $rows = DB::connection('sap')->select($sql);
+  } catch (SapUnavailableException) {
+      return; // the next tick tries again
+  }
+  ```
+
+- **Work that must happen** (a report someone is waiting for, a document that must be sent): put the
+  job back on the queue with jittered minutes, so a fleet of workers doesn't come back in the same
+  second. Don't release it when the breaker has latched (`reason === 'auth'` and `retryAfter === null`):
+  SAP is rejecting the login and only a person can fix that, so let the job fail.
+
+  ```php
+  public $tries = 3;
+
+  public function handle(): void
+  {
+      try {
+          $this->run();
+      } catch (SapUnavailableException $e) {
+          if ($e->reason === 'auth' && $e->retryAfter === null) {
+              throw $e;
+          }
+
+          $this->release(max($e->retryAfter ?? 0, random_int(300, 600)));
+      }
+  }
+  ```
+
+- **Reporting**: one outage can raise thousands of these. Throttle them in `bootstrap/app.php`, so
+  the error tracker gets one event per outage:
+
+  ```php
+  use Illuminate\Cache\RateLimiting\Limit;
+
+  ->withExceptions(function (Exceptions $exceptions) {
+      $exceptions->throttle(fn (Throwable $e) => match (true) {
+          $e instanceof SapUnavailableException => Limit::perMinutes(30, 1)->by('sap-unavailable'),
+          default => Limit::none(),
+      });
+  })
+  ```
 
 The connection is read-only by nature: it has no PDO, so transactions and `cursor()` throw a
 `LogicException`.

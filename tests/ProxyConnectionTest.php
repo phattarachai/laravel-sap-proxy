@@ -9,6 +9,7 @@ use Illuminate\Support\Facades\Event;
 use Illuminate\Support\Facades\Http;
 use Phattarachai\SapProxy\Exceptions\SapProxyException;
 use Phattarachai\SapProxy\Exceptions\SapQueryException;
+use Phattarachai\SapProxy\Exceptions\SapUnavailableException;
 use Phattarachai\SapProxy\ProxyConnection;
 
 function sentSql(Request $request): string
@@ -148,6 +149,90 @@ it('retries a 503 from a web server fronting the proxy', function () {
 
     DB::connection('sap')->select('SELECT 1 FROM DUMMY');
 
+    Http::assertSentCount(2);
+});
+
+it('throws a SapUnavailableException on the proxy\'s flagged 503 without retrying', function () {
+    Http::fake(['proxy.test/*' => Http::response([
+        'error' => 'authentication failed',
+        'sap_unavailable' => true,
+        'reason' => 'auth',
+        'retry_after' => 300,
+    ], 503, ['Retry-After' => '300'])]);
+
+    try {
+        DB::connection('sap')->select('SELECT * FROM OINV');
+        $this->fail('Expected a SapUnavailableException.');
+    } catch (SapUnavailableException $e) {
+        expect($e)->toBeInstanceOf(SapProxyException::class)
+            ->and($e->getMessage())->toBe('SAP [sap] unavailable (auth): authentication failed')
+            ->and($e->reason)->toBe('auth')
+            ->and($e->retryAfter)->toBe(300)
+            ->and($e->context())->toBe([
+                'connection' => 'sap',
+                'sql' => 'SELECT * FROM OINV',
+                'reason' => 'auth',
+                'retry_after' => 300,
+            ]);
+    }
+
+    Http::assertSentCount(1);
+});
+
+it('reads a null retry_after when the proxy\'s breaker has latched', function () {
+    Http::fake(['proxy.test/*' => Http::response([
+        'error' => 'authentication failed',
+        'sap_unavailable' => true,
+        'reason' => 'auth',
+        'retry_after' => null,
+    ], 503)]);
+
+    try {
+        DB::connection('sap')->select('SELECT 1 FROM DUMMY');
+        $this->fail('Expected a SapUnavailableException.');
+    } catch (SapUnavailableException $e) {
+        expect($e->reason)->toBe('auth')
+            ->and($e->retryAfter)->toBeNull()
+            ->and($e->context()['retry_after'])->toBeNull();
+    }
+
+    Http::assertSentCount(1);
+});
+
+it('reports a connect outage with its cooldown', function () {
+    Http::fake(['proxy.test/*' => Http::response([
+        'error' => 'Could not connect to any host: [ 10.0.0.5:30015 - connect ETIMEDOUT ]',
+        'sap_unavailable' => true,
+        'reason' => 'connect',
+        'retry_after' => 30,
+    ], 503, ['Retry-After' => '30'])]);
+
+    expect(fn () => DB::connection('sap')->select('SELECT 1 FROM DUMMY'))
+        ->toThrow(fn (SapUnavailableException $e) => expect($e->reason)->toBe('connect')->and($e->retryAfter)->toBe(30));
+    Http::assertSentCount(1);
+});
+
+it('still retries an unflagged 503 and then throws a plain SapProxyException', function () {
+    Http::fake(['proxy.test/*' => Http::response('<html>503 Service Unavailable</html>', 503)]);
+
+    try {
+        DB::connection('sap')->select('SELECT 1 FROM DUMMY');
+        $this->fail('Expected a SapProxyException.');
+    } catch (SapProxyException $e) {
+        expect($e)->not->toBeInstanceOf(SapUnavailableException::class)
+            ->and($e->getPrevious())->toBeInstanceOf(RequestException::class);
+    }
+
+    Http::assertSentCount(3);
+});
+
+it('stops retrying as soon as a restarting proxy comes back with a flagged 503', function () {
+    Http::fake(['proxy.test/*' => Http::sequence()
+        ->push('', 502)
+        ->push(['error' => 'authentication failed', 'sap_unavailable' => true, 'reason' => 'auth', 'retry_after' => 300], 503),
+    ]);
+
+    expect(fn () => DB::connection('sap')->select('SELECT 1 FROM DUMMY'))->toThrow(SapUnavailableException::class);
     Http::assertSentCount(2);
 });
 

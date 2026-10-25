@@ -15,6 +15,7 @@ use InvalidArgumentException;
 use LogicException;
 use Phattarachai\SapProxy\Exceptions\SapProxyException;
 use Phattarachai\SapProxy\Exceptions\SapQueryException;
+use Phattarachai\SapProxy\Exceptions\SapUnavailableException;
 use Throwable;
 
 /**
@@ -138,6 +139,7 @@ class ProxyConnection extends Connection
      * @param  array<string, mixed>  $extra
      *
      * @throws SapQueryException the proxy answered 422 — HANA rejected the SQL
+     * @throws SapUnavailableException the proxy's breaker is open (flagged 503) — thrown on the first answer, never retried
      * @throws SapProxyException the proxy was unreachable or failed after every retry
      */
     private function send(string $query, array $bindings, array $extra = []): Response
@@ -158,6 +160,10 @@ class ProxyConnection extends Connection
 
         if ($response->status() === 422) {
             throw new SapQueryException((string) $response->json('error', $response->body()), $sql);
+        }
+
+        if (SapUnavailableException::isFlagged($response)) {
+            throw SapUnavailableException::fromResponse($this->getName() ?? $this->proxyConnection, $sql, $response);
         }
 
         if ($response->failed()) {
@@ -183,7 +189,8 @@ class ProxyConnection extends Connection
     /**
      * Retry only what a restarting proxy produces: refused / reset / empty reply, or a 502/503
      * from a web server in front of it. A cURL 28 timeout is a slow query, not a restart —
-     * retrying it would multiply the wait past any job timeout.
+     * retrying it would multiply the wait past any job timeout. The proxy's own flagged 503
+     * (SAP unavailable) is not a restart either: its breaker answers the same until the cooldown ends.
      */
     private static function isRetryable(Throwable $e): bool
     {
@@ -191,7 +198,9 @@ class ProxyConnection extends Connection
             return ! str_contains($e->getMessage(), 'cURL error 28');
         }
 
-        return $e instanceof RequestException && in_array($e->response->status(), [502, 503], true);
+        return $e instanceof RequestException
+            && in_array($e->response->status(), [502, 503], true)
+            && ! SapUnavailableException::isFlagged($e->response);
     }
 
     /**
